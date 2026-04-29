@@ -185,11 +185,24 @@ class MSAB(nn.Module):
         out = x.permute(0, 3, 1, 2)
         return out
 
+import torch.nn as nn
+import torch
+import torch.nn.functional as F
+from einops import rearrange
+import math
+import warnings
+from torch.nn.init import _calculate_fan_in_and_fan_out
+
+# ── (All helper functions unchanged: _no_grad_trunc_normal_, trunc_normal_, variance_scaling_, lecun_normal_, PreNorm, GELU, conv, shift_back, MS_MSA, FeedForward, MSAB) ──
+# ... (keep them exactly as you have them)
+
 class MST(nn.Module):
-    def __init__(self, in_dim=31, out_dim=31, dim=31, stage=2, num_blocks=[2,4,4]):
+    def __init__(self, in_dim, out_dim, dim, stage=2, num_blocks=[2,4,4]):
         super(MST, self).__init__()
         self.dim = dim
         self.stage = stage
+        self.in_dim = in_dim
+        self.out_dim = out_dim
 
         # Input projection
         self.embedding = nn.Conv2d(in_dim, self.dim, 3, 1, 1, bias=False)
@@ -199,15 +212,13 @@ class MST(nn.Module):
         dim_stage = dim
         for i in range(stage):
             self.encoder_layers.append(nn.ModuleList([
-                MSAB(
-                    dim=dim_stage, num_blocks=num_blocks[i], dim_head=dim, heads=dim_stage // dim),
+                MSAB(dim=dim_stage, num_blocks=num_blocks[i], dim_head=dim, heads=dim_stage // dim),
                 nn.Conv2d(dim_stage, dim_stage * 2, 4, 2, 1, bias=False),
             ]))
             dim_stage *= 2
 
         # Bottleneck
-        self.bottleneck = MSAB(
-            dim=dim_stage, dim_head=dim, heads=dim_stage // dim, num_blocks=num_blocks[-1])
+        self.bottleneck = MSAB(dim=dim_stage, dim_head=dim, heads=dim_stage // dim, num_blocks=num_blocks[-1])
 
         # Decoder
         self.decoder_layers = nn.ModuleList([])
@@ -215,16 +226,20 @@ class MST(nn.Module):
             self.decoder_layers.append(nn.ModuleList([
                 nn.ConvTranspose2d(dim_stage, dim_stage // 2, stride=2, kernel_size=2, padding=0, output_padding=0),
                 nn.Conv2d(dim_stage, dim_stage // 2, 1, 1, bias=False),
-                MSAB(
-                    dim=dim_stage // 2, num_blocks=num_blocks[stage - 1 - i], dim_head=dim,
-                    heads=(dim_stage // 2) // dim),
+                MSAB(dim=dim_stage // 2, num_blocks=num_blocks[stage - 1 - i], dim_head=dim,
+                     heads=(dim_stage // 2) // dim),
             ]))
             dim_stage //= 2
 
         # Output projection
         self.mapping = nn.Conv2d(self.dim, out_dim, 3, 1, 1, bias=False)
 
-        #### activation function
+        # 🔧 Skip connection alignment: project input if in_dim != out_dim
+        if in_dim != out_dim:
+            self.skip_proj = nn.Conv2d(in_dim, out_dim, kernel_size=1, bias=False)
+        else:
+            self.skip_proj = nn.Identity()
+
         self.lrelu = nn.LeakyReLU(negative_slope=0.1, inplace=True)
         self.apply(self._init_weights)
 
@@ -239,69 +254,70 @@ class MST(nn.Module):
 
     def forward(self, x):
         """
-        x: [b,c,h,w]
-        return out:[b,c,h,w]
+        x: [b, in_dim, h, w]
+        return out: [b, out_dim, h, w]
         """
-
-        # Embedding
         fea = self.embedding(x)
-
-        # Encoder
         fea_encoder = []
         for (MSAB, FeaDownSample) in self.encoder_layers:
             fea = MSAB(fea)
             fea_encoder.append(fea)
             fea = FeaDownSample(fea)
-
-        # Bottleneck
         fea = self.bottleneck(fea)
-
-        # Decoder
         for i, (FeaUpSample, Fution, LeWinBlcok) in enumerate(self.decoder_layers):
             fea = FeaUpSample(fea)
             fea = Fution(torch.cat([fea, fea_encoder[self.stage-1-i]], dim=1))
             fea = LeWinBlcok(fea)
-
-        # Mapping
-        out = self.mapping(fea) + x
-
+        out = self.mapping(fea) + self.skip_proj(x)   # skip now matches out_dim
         return out
 
+
 class MST_Plus_Plus(nn.Module):
-    def __init__(self, in_channels=3, out_channels=31, n_feat=31, stage=3):
+    def __init__(self, in_channels=3, out_channels=20, n_feat=None, stage=3):
         super(MST_Plus_Plus, self).__init__()
+        if n_feat is None:
+            n_feat = out_channels   # essential: keep n_feat == out_channels to avoid mismatch
         self.stage = stage
-        self.conv_in = nn.Conv2d(in_channels, n_feat, kernel_size=3, padding=(3 - 1) // 2,bias=False)
-        modules_body = [MST(dim=31, stage=2, num_blocks=[1,1,1]) for _ in range(stage)]
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.n_feat = n_feat
+
+        self.conv_in = nn.Conv2d(in_channels, n_feat, kernel_size=3, padding=1, bias=False)
+
+        # Each MST block processes n_feat → n_feat
+        modules_body = [
+            MST(in_dim=n_feat, out_dim=n_feat, dim=n_feat, stage=2, num_blocks=[1,1,1])
+            for _ in range(stage)
+        ]
         self.body = nn.Sequential(*modules_body)
-        self.conv_out = nn.Conv2d(n_feat, out_channels, kernel_size=3, padding=(3 - 1) // 2,bias=False)
+        self.conv_out = nn.Conv2d(n_feat, out_channels, kernel_size=3, padding=1, bias=False)
+
+        # 🔧 Global skip: RGB → output
+        if in_channels != out_channels:
+            self.skip_proj = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        else:
+            self.skip_proj = nn.Identity()
 
     def forward(self, x):
         """
-        x: [b,c,h,w]
-        return out:[b,c,h,w]
+        x: [b, c, h, w] (c=3)
+        return: [b, out_channels, h, w]
         """
         b, c, h_inp, w_inp = x.shape
+        x_rgb = x   # keep original for global skip
+
         hb, wb = 8, 8
         pad_h = (hb - h_inp % hb) % hb
         pad_w = (wb - w_inp % wb) % wb
         x = F.pad(x, [0, pad_w, 0, pad_h], mode='reflect')
-        x = self.conv_in(x)
-        h = self.body(x)
-        h = self.conv_out(h)
-        h += x
+
+        x = self.conv_in(x)          # [b, n_feat, H, W]
+        h = self.body(x)             # [b, n_feat, H, W]
+        h = self.conv_out(h)         # [b, out_channels, H, W]
+
+        # Global skip from original RGB (aligned to out_channels)
+        skip = self.skip_proj(x_rgb)
+        h[:, :, :h_inp, :w_inp] += skip
+
         return h[:, :, :h_inp, :w_inp]
-
-
-
-
-
-
-
-
-
-
-
-
-
 
