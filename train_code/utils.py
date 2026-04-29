@@ -24,7 +24,9 @@ class AverageMeter(object):
 
 
 def initialize_logger(file_dir):
-    logger = logging.getLogger()
+    #logger = logging.getLogger()
+    logger = logging.getLogger(__name__)
+    logger.handlers.clear()
     fhandler = logging.FileHandler(filename=file_dir, mode='a')
     formatter = logging.Formatter('%(asctime)s - %(message)s', "%Y-%m-%d %H:%M:%S")
     fhandler.setFormatter(formatter)
@@ -48,9 +50,31 @@ class Loss_MRAE(nn.Module):
 
     def forward(self, outputs, label):
         assert outputs.shape == label.shape
-        error = torch.abs(outputs - label) / label
+        error = torch.abs(outputs - label) / (label + 1e-6)
         mrae = torch.mean(error.view(-1))
         return mrae
+
+class Loss_MRAE_SAM(nn.Module):
+    def __init__(self, alpha=0.8):
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(self, pred, target):
+        mrae = torch.mean(torch.abs(pred - target) / (target + 1e-6))
+        
+        pred_ = pred.view(pred.size(0), pred.size(1), -1)
+        target_ = target.view(target.size(0), target.size(1), -1)
+
+        dot = torch.sum(pred_ * target_, dim=1)
+        norm_p = torch.norm(pred_, dim=1)
+        norm_t = torch.norm(target_, dim=1)
+
+        cos = dot / (norm_p * norm_t + 1e-8)
+        cos = torch.clamp(cos, -1, 1)
+
+        sam = torch.mean(torch.acos(cos))
+
+        return self.alpha * mrae + (1 - self.alpha) * sam
 
 
 class Loss_MRAE_custom(nn.Module):
@@ -92,7 +116,7 @@ class Loss_PSNR(nn.Module):
         W = im_true.size()[3]
         Itrue = im_true.clamp(0., 1.).mul_(data_range).resize_(N, C * H * W)
         Ifake = im_fake.clamp(0., 1.).mul_(data_range).resize_(N, C * H * W)
-        mse = nn.MSELoss(reduce=False)
+        mse = nn.MSELoss(reduction='none')
         err = mse(Itrue, Ifake).sum(dim=1, keepdim=True).div_(C * H * W)
         psnr = 10. * torch.log((data_range ** 2) / err) / np.log(10.)
         return torch.mean(psnr)
@@ -111,4 +135,4 @@ def record_loss(loss_csv, epoch, iteration, epoch_time, lr, train_loss, test_los
     """ Record many results."""
     loss_csv.write('{},{},{},{},{},{}\n'.format(epoch, iteration, epoch_time, lr, train_loss, test_loss))
     loss_csv.flush()
-    loss_csv.close
+    #loss_csv.close
